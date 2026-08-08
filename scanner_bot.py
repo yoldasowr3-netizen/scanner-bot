@@ -4,6 +4,7 @@ import time
 import requests
 import json
 import os
+import threading
 from datetime import datetime, timedelta
 import urllib3
 
@@ -74,53 +75,46 @@ def send_telegram_message(message):
         print(f"❌ Telegram ошибка: {e}")
         return False
 
-# 🔧 НОВАЯ ФУНКЦИЯ: ПРОВЕРКА ВХОДЯЩИХ СООБЩЕНИЙ
-def check_telegram_commands(offset):
-    """Проверяет новые сообщения от пользователя"""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-        params = {'offset': offset, 'timeout': 1}
-        response = requests.get(url, params=params, verify=False, timeout=5)
-        updates = response.json()
-        
-        if updates.get('ok') and updates.get('result'):
-            for update in updates['result']:
-                new_offset = update['update_id'] + 1
-                
-                if 'message' in update:
-                    chat_id = update['message']['chat']['id']
-                    text = update['message'].get('text', '').strip().lower()
-                    
-                    # Команда /start - проверка статуса бота
-                    if text == '/start':
-                        uptime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        msg = (
-                            f"✅ <b>БОТ РАБОТАЕТ!</b>\n\n"
-                            f" <b>Статус:</b> Активен\n"
-                            f"⏰ <b>Время проверки:</b> {uptime}\n"
-                            f"📊 <b>Таймфреймы:</b> {', '.join(TIMEFRAMES)}\n"
-                            f" <b>Мин. объем:</b> ${VOLUME_MIN:,}\n"
-                            f" <b>Стратегия:</b> SL 3.5% | TP1 3% | TP2 7%\n"
-                            f"⏰ <b>Кулдаун:</b> {SIGNAL_COOLDOWN_HOURS} часов\n\n"
-                            f"💡 <i>Бот непрерывно сканирует рынок и пришлёт сигнал, когда найдёт!</i>"
-                        )
-                        send_telegram_message(msg)
-                        print(f"📨 Отправлен статус бота")
-                    
-                    # Команда /status - тоже проверка
-                    elif text == '/status':
-                        msg = (
-                            f"✅ <b>БОТ РАБОТАЕТ!</b>\n\n"
-                            f"🤖 Статус: Активен\n"
-                            f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                        )
-                        send_telegram_message(msg)
-            
-            return new_offset
-    except Exception as e:
-        pass
+# 🔧 НОВЫЙ ПОТОК: Проверка команд Telegram
+def telegram_commands_listener():
+    """Отдельный поток для мгновенной обработки команд"""
+    print(" Запуск слушателя команд Telegram...")
+    offset = 0
     
-    return offset
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {'offset': offset, 'timeout': 1}
+            response = requests.get(url, params=params, verify=False, timeout=5)
+            updates = response.json()
+            
+            if updates.get('ok') and updates.get('result'):
+                for update in updates['result']:
+                    offset = update['update_id'] + 1
+                    
+                    if 'message' in update:
+                        chat_id = update['message']['chat']['id']
+                        text = update['message'].get('text', '').strip().lower()
+                        
+                        if text == '/start' or text == '/status':
+                            uptime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            msg = (
+                                f"✅ <b>БОТ РАБОТАЕТ!</b>\n\n"
+                                f"🟢 <b>Статус:</b> Активен\n"
+                                f"⏰ <b>Время:</b> {uptime}\n"
+                                f" <b>Таймфреймы:</b> {', '.join(TIMEFRAMES)}\n"
+                                f"💰 <b>Мин. объем:</b> ${VOLUME_MIN:,}\n"
+                                f"🎯 <b>Стратегия:</b> SL 3.5% | TP1 3% | TP2 7%\n"
+                                f"⏰ <b>Кулдаун:</b> {SIGNAL_COOLDOWN_HOURS} часов\n\n"
+                                f"💡 <i>Бот непрерывно сканирует рынок!</i>"
+                            )
+                            send_telegram_message(msg)
+                            print(f"📨 Отправлен статус по команде {text}")
+                            
+        except Exception as e:
+            pass
+        
+        time.sleep(1)
 
 # --- БИРЖА ---
 def init_exchange():
@@ -177,16 +171,16 @@ def check_signal(exchange, symbol, timeframe, volume_24h):
                 f"🚨 <b>СИГНАЛ НА ПОКУПКУ!</b>\n"
                 f"━━━━━━━━━━━━━━━━\n"
                 f"💰 <b>Монета:</b> {coin_name}\n"
-                f"💵 <b>Пара:</b> {symbol.replace('/', '')}\n"
+                f" <b>Пара:</b> {symbol.replace('/', '')}\n"
                 f"💲 <b>Цена входа:</b> ${current_price:.8f}\n"
-                f" <b>Объем 24ч:</b> ${volume_24h:,.0f}\n"
+                f"📊 <b>Объем 24ч:</b> ${volume_24h:,.0f}\n"
                 f"━━━━━━━━━━━━━━━━\n"
                 f"🎯 <b>ЦЕЛЬ 1 (+3%):</b> ${tp1_price:.8f} <i>(Забрать 50%)</i>\n"
-                f"🎯 <b>ЦЕЛЬ 2 (+7%):</b> ${tp2_price:.8f} <i>(Забрать остаток)</i>\n"
+                f" <b>ЦЕЛЬ 2 (+7%):</b> ${tp2_price:.8f} <i>(Забрать остаток)</i>\n"
                 f"🛑 <b>СТОП-ЛОСС (-3.5%):</b> ${stop_loss_price:.8f}\n"
                 f"━━━━━━━━━━━━━━━━\n"
                 f"💡 <i>Совет: Забери половину на Цели 1 и переведи стоп в безубыток!</i>\n"
-                f"⏱ <b>Таймфрейм:</b> {timeframe}\n"
+                f" <b>Таймфрейм:</b> {timeframe}\n"
                 f"📈 <b>RSI:</b> {curr_rsi:.2f} | <b>SMA:</b> {curr_sma:.2f}\n"
                 f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"🔄 #{coin_name}"
@@ -201,11 +195,11 @@ def check_signal(exchange, symbol, timeframe, volume_24h):
 # --- ГЛАВНАЯ ---
 def main():
     print("="*50)
-    print("🚀 ЗАПУСК СКАНЕРА СИГНАЛОВ (С УРОВНЯМИ)")
+    print(" ЗАПУСК СКАНЕРА СИГНАЛОВ (С УРОВНЯМИ)")
     print("="*50)
-    print(f" Таймфреймы: {TIMEFRAMES}")
+    print(f"⏱ Таймфреймы: {TIMEFRAMES}")
     print(f"💰 Мин. объем: ${VOLUME_MIN:,}")
-    print(f" Кулдаун: {SIGNAL_COOLDOWN_HOURS} часов")
+    print(f"⏰ Кулдаун: {SIGNAL_COOLDOWN_HOURS} часов")
     print("="*50)
     
     exchange = init_exchange()
@@ -216,10 +210,15 @@ def main():
         f"🤖 <b>Сканер запущен!</b>\n\n"
         f"⏱ Таймфреймы: {', '.join(TIMEFRAMES)}\n"
         f"💰 Мин. объем: ${VOLUME_MIN:,}\n"
-        f" Стратегия: SL 3.5% | TP1 3% | TP2 7%\n"
+        f"🎯 Стратегия: SL 3.5% | TP1 3% | TP2 7%\n"
         f"⏰ Кулдаун: {SIGNAL_COOLDOWN_HOURS} часов\n\n"
         f"💡 Напиши <b>/start</b> чтобы проверить статус бота"
     )
+    
+    # 🔧 ЗАПУСКАЕМ СЛУШАТЕЛЬ КОМАНД В ОТДЕЛЬНОМ ПОТОКЕ
+    listener_thread = threading.Thread(target=telegram_commands_listener, daemon=True)
+    listener_thread.start()
+    print("✅ Слушатель команд запущен в отдельном потоке")
     
     # Получаем все монеты с объёмом один раз
     print("\n📊 Загружаем список монет...")
@@ -234,9 +233,6 @@ def main():
     
     print(f"✅ Найдено {len(qualified_symbols)} монет с объёмом > ${VOLUME_MIN:,}")
     
-    # 🔧 Offset для getUpdates
-    offset = 0
-    
     # Бесконечный цикл проверки
     cycle = 1
     while True:
@@ -248,7 +244,7 @@ def main():
             signals_found = 0
             
             for timeframe in TIMEFRAMES:
-                print(f"\n⏰ Таймфрейм: {timeframe}")
+                print(f"\n Таймфрейм: {timeframe}")
                 
                 for i, (symbol, volume) in enumerate(qualified_symbols, 1):
                     if i % 50 == 0:
@@ -276,11 +272,9 @@ def main():
             
             cycle += 1
             
-            # 🔧 ПРОВЕРЯЕМ КОМАНДЫ ТЕЛЕГРАМ во время паузы
+            # Пауза между циклами
             print("\n⏳ Пауза 10 секунд...")
-            for _ in range(10):
-                offset = check_telegram_commands(offset)
-                time.sleep(1)
+            time.sleep(10)
             
         except KeyboardInterrupt:
             print("\n👋 Остановлено")

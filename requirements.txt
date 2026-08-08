@@ -1,6 +1,6 @@
    python-telegram-bot
-ccxt
-pandas
-pandas_ta_classic
-requests
-urllib3
+   ccxt
+   pandas
+   pandas-ta
+   requests
+   urllib3

@@ -22,7 +22,7 @@ SIGNAL_COOLDOWN_HOURS = 24
 
 SIGNAL_HISTORY_FILE = "signal_history.json"
 
-# --- ИСТОРИЯ ---
+# --- ИСТОРИЯ СИГНАЛОВ ---
 def load_signal_history():
     try:
         if os.path.exists(SIGNAL_HISTORY_FILE):
@@ -74,6 +74,54 @@ def send_telegram_message(message):
         print(f"❌ Telegram ошибка: {e}")
         return False
 
+# 🔧 НОВАЯ ФУНКЦИЯ: ПРОВЕРКА ВХОДЯЩИХ СООБЩЕНИЙ
+def check_telegram_commands(offset):
+    """Проверяет новые сообщения от пользователя"""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        params = {'offset': offset, 'timeout': 1}
+        response = requests.get(url, params=params, verify=False, timeout=5)
+        updates = response.json()
+        
+        if updates.get('ok') and updates.get('result'):
+            for update in updates['result']:
+                new_offset = update['update_id'] + 1
+                
+                if 'message' in update:
+                    chat_id = update['message']['chat']['id']
+                    text = update['message'].get('text', '').strip().lower()
+                    
+                    # Команда /start - проверка статуса бота
+                    if text == '/start':
+                        uptime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        msg = (
+                            f"✅ <b>БОТ РАБОТАЕТ!</b>\n\n"
+                            f" <b>Статус:</b> Активен\n"
+                            f"⏰ <b>Время проверки:</b> {uptime}\n"
+                            f"📊 <b>Таймфреймы:</b> {', '.join(TIMEFRAMES)}\n"
+                            f" <b>Мин. объем:</b> ${VOLUME_MIN:,}\n"
+                            f" <b>Стратегия:</b> SL 3.5% | TP1 3% | TP2 7%\n"
+                            f"⏰ <b>Кулдаун:</b> {SIGNAL_COOLDOWN_HOURS} часов\n\n"
+                            f"💡 <i>Бот непрерывно сканирует рынок и пришлёт сигнал, когда найдёт!</i>"
+                        )
+                        send_telegram_message(msg)
+                        print(f"📨 Отправлен статус бота")
+                    
+                    # Команда /status - тоже проверка
+                    elif text == '/status':
+                        msg = (
+                            f"✅ <b>БОТ РАБОТАЕТ!</b>\n\n"
+                            f"🤖 Статус: Активен\n"
+                            f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                        send_telegram_message(msg)
+            
+            return new_offset
+    except Exception as e:
+        pass
+    
+    return offset
+
 # --- БИРЖА ---
 def init_exchange():
     try:
@@ -121,10 +169,9 @@ def check_signal(exchange, symbol, timeframe, volume_24h):
             current_price = df['close'].iloc[-1]
             coin_name = symbol.replace('/USDT', '')
             
-            # 🎯 РАСЧЕТ УРОВНЕЙ (Стоп 3.5%, Тейк 1: 3%, Тейк 2: 7%)
-            stop_loss_price = current_price * 0.965   # -3.5%
-            tp1_price = current_price * 1.03          # +3% (частичная фиксация)
-            tp2_price = current_price * 1.07          # +7% (полная фиксация)
+            stop_loss_price = current_price * 0.965
+            tp1_price = current_price * 1.03
+            tp2_price = current_price * 1.07
             
             message = (
                 f"🚨 <b>СИГНАЛ НА ПОКУПКУ!</b>\n"
@@ -132,7 +179,7 @@ def check_signal(exchange, symbol, timeframe, volume_24h):
                 f"💰 <b>Монета:</b> {coin_name}\n"
                 f"💵 <b>Пара:</b> {symbol.replace('/', '')}\n"
                 f"💲 <b>Цена входа:</b> ${current_price:.8f}\n"
-                f"📊 <b>Объем 24ч:</b> ${volume_24h:,.0f}\n"
+                f" <b>Объем 24ч:</b> ${volume_24h:,.0f}\n"
                 f"━━━━━━━━━━━━━━━━\n"
                 f"🎯 <b>ЦЕЛЬ 1 (+3%):</b> ${tp1_price:.8f} <i>(Забрать 50%)</i>\n"
                 f"🎯 <b>ЦЕЛЬ 2 (+7%):</b> ${tp2_price:.8f} <i>(Забрать остаток)</i>\n"
@@ -156,9 +203,9 @@ def main():
     print("="*50)
     print("🚀 ЗАПУСК СКАНЕРА СИГНАЛОВ (С УРОВНЯМИ)")
     print("="*50)
-    print(f"⏱ Таймфреймы: {TIMEFRAMES}")
+    print(f" Таймфреймы: {TIMEFRAMES}")
     print(f"💰 Мин. объем: ${VOLUME_MIN:,}")
-    print(f"⏰ Кулдаун: {SIGNAL_COOLDOWN_HOURS} часов")
+    print(f" Кулдаун: {SIGNAL_COOLDOWN_HOURS} часов")
     print("="*50)
     
     exchange = init_exchange()
@@ -169,8 +216,9 @@ def main():
         f"🤖 <b>Сканер запущен!</b>\n\n"
         f"⏱ Таймфреймы: {', '.join(TIMEFRAMES)}\n"
         f"💰 Мин. объем: ${VOLUME_MIN:,}\n"
-        f"🎯 Стратегия: SL 3.5% | TP1 3% | TP2 7%\n"
-        f"⏰ Кулдаун: {SIGNAL_COOLDOWN_HOURS} часов"
+        f" Стратегия: SL 3.5% | TP1 3% | TP2 7%\n"
+        f"⏰ Кулдаун: {SIGNAL_COOLDOWN_HOURS} часов\n\n"
+        f"💡 Напиши <b>/start</b> чтобы проверить статус бота"
     )
     
     # Получаем все монеты с объёмом один раз
@@ -185,6 +233,9 @@ def main():
                 qualified_symbols.append((symbol, volume_24h))
     
     print(f"✅ Найдено {len(qualified_symbols)} монет с объёмом > ${VOLUME_MIN:,}")
+    
+    # 🔧 Offset для getUpdates
+    offset = 0
     
     # Бесконечный цикл проверки
     cycle = 1
@@ -225,9 +276,11 @@ def main():
             
             cycle += 1
             
-            # Минимальная пауза между циклами (10 секунд)
+            # 🔧 ПРОВЕРЯЕМ КОМАНДЫ ТЕЛЕГРАМ во время паузы
             print("\n⏳ Пауза 10 секунд...")
-            time.sleep(10)
+            for _ in range(10):
+                offset = check_telegram_commands(offset)
+                time.sleep(1)
             
         except KeyboardInterrupt:
             print("\n👋 Остановлено")

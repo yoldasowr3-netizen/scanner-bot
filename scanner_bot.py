@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-import pandas_ta_classic as ta
+import pandas_ta as ta
 
 # --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = "7591952058:AAGDDfxq6Tz_PHR25WG-0PsONySug4iQ1B0"

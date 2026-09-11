@@ -12,8 +12,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import pandas_ta as ta
 
 # --- НАСТРОЙКИ ---
-TELEGRAM_BOT_TOKEN = "AAHoTf6dN0tRTxLCIgFvFVqP73thALh4M7s"
-TELEGRAM_CHAT_ID = "6759712444"
+TELEGRAM_BOT_TOKEN = "AAHcPoLYqKscWaTd5MjZGUSNgOwn17lntuM"
+TELEGRAM_CHAT_ID = "8969022054"
 
 TIMEFRAMES = ['1h', '4h', '1d']
 RSI_PERIOD = 14

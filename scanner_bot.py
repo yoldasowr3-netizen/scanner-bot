@@ -1,292 +1,395 @@
 import ccxt
-import pandas as pd
-import time
-import requests
-import json
-import os
-import threading
-from datetime import datetime, timedelta
+import asyncio
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import urllib3
+import mplfinance as mpf
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+import numpy as np
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-import pandas_ta as ta
 
 # --- НАСТРОЙКИ ---
-TELEGRAM_BOT_TOKEN = "AAHcPoLYqKscWaTd5MjZGUSNgOwn17lntuM"
-TELEGRAM_CHAT_ID = "8969022054"
+TELEGRAM_BOT_TOKEN = "8969022054:AAFW624orWdf7zjc6ZzoSfjvRlP9PmZHAOE"
+MIN_VOLUME = 5_000_000
+CHART_CANDLES = 50
+MIN_TOUCHES = 2
+TOUCH_TOLERANCE = 0.005
 
-TIMEFRAMES = ['1h', '4h', '1d']
-RSI_PERIOD = 14
-SMA_PERIOD = 14
-VOLUME_MIN = 1_000_000
-SIGNAL_COOLDOWN_HOURS = 24
-
-SIGNAL_HISTORY_FILE = "signal_history.json"
-
-# --- ИСТОРИЯ СИГНАЛОВ ---
-def load_signal_history():
-    try:
-        if os.path.exists(SIGNAL_HISTORY_FILE):
-            with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {}
-    except:
-        return {}
-
-def save_signal_history(history):
-    try:
-        with open(SIGNAL_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"❌ Ошибка сохранения: {e}")
-
-def can_send_signal(symbol, timeframe):
-    history = load_signal_history()
-    key = f"{symbol}_{timeframe}"
-    current_time = datetime.now()
-    
-    if key in history:
-        last_signal_time = datetime.fromisoformat(history[key])
-        time_diff = current_time - last_signal_time
-        
-        if time_diff < timedelta(hours=SIGNAL_COOLDOWN_HOURS):
-            return False
-    
-    return True
-
-def record_signal(symbol, timeframe):
-    history = load_signal_history()
-    key = f"{symbol}_{timeframe}"
-    history[key] = datetime.now().isoformat()
-    save_signal_history(history)
-
-# --- TELEGRAM ---
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': TELEGRAM_CHAT_ID,
-        'text': message,
-        'parse_mode': 'HTML'
-    }
-    try:
-        response = requests.post(url, json=payload, verify=False, timeout=30)
-        return True
-    except Exception as e:
-        print(f"❌ Telegram ошибка: {e}")
-        return False
-
-# 🔧 НОВЫЙ ПОТОК: Проверка команд Telegram
-def telegram_commands_listener():
-    """Отдельный поток для мгновенной обработки команд"""
-    print(" Запуск слушателя команд Telegram...")
-    offset = 0
-    
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {'offset': offset, 'timeout': 1}
-            response = requests.get(url, params=params, verify=False, timeout=5)
-            updates = response.json()
-            
-            if updates.get('ok') and updates.get('result'):
-                for update in updates['result']:
-                    offset = update['update_id'] + 1
-                    
-                    if 'message' in update:
-                        chat_id = update['message']['chat']['id']
-                        text = update['message'].get('text', '').strip().lower()
-                        
-                        if text == '/start' or text == '/status':
-                            uptime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            msg = (
-                                f"✅ <b>БОТ РАБОТАЕТ!</b>\n\n"
-                                f"🟢 <b>Статус:</b> Активен\n"
-                                f"⏰ <b>Время:</b> {uptime}\n"
-                                f" <b>Таймфреймы:</b> {', '.join(TIMEFRAMES)}\n"
-                                f"💰 <b>Мин. объем:</b> ${VOLUME_MIN:,}\n"
-                                f"🎯 <b>Стратегия:</b> SL 3.5% | TP1 3% | TP2 7%\n"
-                                f"⏰ <b>Кулдаун:</b> {SIGNAL_COOLDOWN_HOURS} часов\n\n"
-                                f"💡 <i>Бот непрерывно сканирует рынок!</i>"
-                            )
-                            send_telegram_message(msg)
-                            print(f"📨 Отправлен статус по команде {text}")
-                            
-        except Exception as e:
-            pass
-        
-        time.sleep(1)
-
-# --- БИРЖА ---
-def init_exchange():
-    try:
-        exchange = ccxt.binance({
-            'enableRateLimit': True,
+def get_exchanges():
+    return {
+        'Binance': ccxt.binance({'enableRateLimit': True, 'timeout': 30000}),
+        'Bybit': ccxt.bybit({'enableRateLimit': True, 'timeout': 30000}),
+        'Bitget': ccxt.bitget({'enableRateLimit': True, 'timeout': 30000}),
+        'BingX': ccxt.bingx({'enableRateLimit': True, 'timeout': 30000}),
+        'MEXC': ccxt.mexc({
+            'enableRateLimit': True, 
+            'timeout': 30000,
             'options': {'defaultType': 'spot'}
         })
-        print("✅ Биржа инициализирована")
-        return exchange
+    }
+
+# --- ПОИСК УРОВНЕЙ ---
+def find_support_resistance_levels(df, current_price, min_touches=MIN_TOUCHES, tolerance=TOUCH_TOLERANCE):
+    """Находит только НЕПРОБИТЫЕ уровни поддержки/сопротивления"""
+    levels = []
+    
+    highs = df['high'].values
+    lows = df['low'].values
+    
+    # Сопротивление (выше текущей цены)
+    for i in range(2, len(highs) - 2):
+        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+            level_price = highs[i]
+            if level_price <= current_price:
+                continue
+            touches = sum(1 for j in range(len(highs)) if abs(highs[j] - level_price) / level_price <= tolerance)
+            if touches >= min_touches:
+                levels.append({'price': level_price, 'touches': touches, 'type': 'resistance'})
+    
+    # Поддержка (ниже текущей цены)
+    for i in range(2, len(lows) - 2):
+        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+            level_price = lows[i]
+            if level_price >= current_price:
+                continue
+            touches = sum(1 for j in range(len(lows)) if abs(lows[j] - level_price) / level_price <= tolerance)
+            if touches >= min_touches:
+                levels.append({'price': level_price, 'touches': touches, 'type': 'support'})
+    
+    # Удаляем дубликаты
+    unique_levels = []
+    for level in levels:
+        if not any(abs(level['price'] - u['price']) / u['price'] <= tolerance * 2 for u in unique_levels):
+            unique_levels.append(level)
+    
+    unique_levels.sort(key=lambda x: x['touches'], reverse=True)
+    return unique_levels[:5]
+
+# --- ГЕНЕРАЦИЯ ГРАФИКА С УРОВНЯМИ ---
+def create_chart(symbol, chart_exchanges):
+    """Создаёт график с двумя таймфреймами и уровнями S/R"""
+    try:
+        ohlcv_1h = None
+        ohlcv_4h = None
+        
+        for ex_name in ['Binance', 'Bybit', 'Bitget', 'BingX', 'MEXC']:
+            if ex_name in chart_exchanges:
+                try:
+                    ohlcv_1h = chart_exchanges[ex_name].fetch_ohlcv(symbol, timeframe='1h', limit=CHART_CANDLES)
+                    ohlcv_4h = chart_exchanges[ex_name].fetch_ohlcv(symbol, timeframe='4h', limit=CHART_CANDLES)
+                    if ohlcv_1h and ohlcv_4h and len(ohlcv_1h) >= 10 and len(ohlcv_4h) >= 10:
+                        print(f"  📊 Данные взяты с {ex_name}")
+                        break
+                except:
+                    ohlcv_1h = None
+                    ohlcv_4h = None
+                    continue
+        
+        if not ohlcv_1h or not ohlcv_4h:
+            return None
+        
+        df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df_1h['timestamp'] = pd.to_datetime(df_1h['timestamp'], unit='ms')
+        df_1h.set_index('timestamp', inplace=True)
+        
+        df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df_4h['timestamp'] = pd.to_datetime(df_4h['timestamp'], unit='ms')
+        df_4h.set_index('timestamp', inplace=True)
+        
+        current_price = df_1h['close'].iloc[-1]
+        
+        # Находим уровни
+        levels_1h = find_support_resistance_levels(df_1h, current_price)
+        levels_4h = find_support_resistance_levels(df_4h, current_price)
+        
+        # Стиль
+        mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', edge='inherit', wick='inherit')
+        style = mpf.make_mpf_style(
+            marketcolors=mc, figcolor='#131722', facecolor='#131722',
+            gridcolor='#2a2e39', gridstyle='-', y_on_right=True
+        )
+        
+        # Создаём два подграфика
+        fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=False)
+        fig.patch.set_facecolor('#131722')
+        
+        # 1H график
+        mpf.plot(df_1h, type='candle', style=style, ax=axes[0], volume=False)
+        axes[0].set_title(f'{symbol} - 1H | Уровни S/R', color='white', fontsize=12, pad=10)
+        axes[0].set_facecolor('#131722')
+        axes[0].tick_params(colors='white')
+        
+        # Рисуем уровни на 1H
+        for level in levels_1h:
+            price = level['price']
+            touches = level['touches']
+            color = '#FF4444' if level['type'] == 'resistance' else '#00FF88'
+            linewidth = 2.5 if touches >= 3 else 1.5
+            axes[0].axhline(y=price, color=color, linewidth=linewidth, alpha=0.8)
+            axes[0].text(len(df_1h) * 0.02, price, f' {price:.6f} ({touches}x)', 
+                        color=color, fontsize=9, fontweight='bold',
+                        bbox=dict(boxstyle='round', facecolor='#131722', edgecolor=color, alpha=0.8))
+        
+        # Текущая цена на 1H
+        axes[0].axhline(y=current_price, color='#FFD700', linewidth=1.5, linestyle='--', alpha=0.7)
+        
+        # 4H график
+        mpf.plot(df_4h, type='candle', style=style, ax=axes[1], volume=False)
+        axes[1].set_title(f'{symbol} - 4H | Уровни S/R', color='white', fontsize=12, pad=10)
+        axes[1].set_facecolor('#131722')
+        axes[1].tick_params(colors='white')
+        
+        # Рисуем уровни на 4H
+        for level in levels_4h:
+            price = level['price']
+            touches = level['touches']
+            color = '#FF4444' if level['type'] == 'resistance' else '#00FF88'
+            linewidth = 2.5 if touches >= 3 else 1.5
+            axes[1].axhline(y=price, color=color, linewidth=linewidth, alpha=0.8)
+            axes[1].text(len(df_4h) * 0.02, price, f' {price:.6f} ({touches}x)', 
+                        color=color, fontsize=9, fontweight='bold',
+                        bbox=dict(boxstyle='round', facecolor='#131722', edgecolor=color, alpha=0.8))
+        
+        # Текущая цена на 4H
+        axes[1].axhline(y=current_price, color='#FFD700', linewidth=1.5, linestyle='--', alpha=0.7)
+        
+        plt.tight_layout()
+        
+        filename = f'chart_{symbol.replace("/", "")}.png'
+        plt.savefig(filename, dpi=100, bbox_inches='tight', facecolor='#131722')
+        plt.close()
+        
+        print(f"✅ График сохранён: {filename} (1H: {len(levels_1h)} уровней, 4H: {len(levels_4h)} уровней)")
+        return filename
+        
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        print(f"❌ Ошибка создания графика {symbol}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
-# --- ПРОВЕРКА СИГНАЛА ---
-def check_signal(exchange, symbol, timeframe, volume_24h):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
-        if len(bars) < 50:
-            return False, ""
-            
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        df['rsi'] = ta.rsi(df['close'], length=RSI_PERIOD)
-        df['sma_of_rsi'] = ta.sma(df['rsi'], length=SMA_PERIOD)
-        
-        df = df.dropna().reset_index(drop=True)
-        
-        if len(df) < 2:
-            return False, ""
-        
-        prev_rsi = df['rsi'].iloc[-2]
-        curr_rsi = df['rsi'].iloc[-1]
-        prev_sma = df['sma_of_rsi'].iloc[-2]
-        curr_sma = df['sma_of_rsi'].iloc[-1]
-        
-        crossover = (prev_rsi <= prev_sma) and (curr_rsi > curr_sma)
-        below_40 = (curr_rsi < 40) and (curr_sma < 40)
-        
-        if crossover and below_40:
-            if not can_send_signal(symbol, timeframe):
-                return False, ""
-            
-            record_signal(symbol, timeframe)
-            
-            current_price = df['close'].iloc[-1]
-            coin_name = symbol.replace('/USDT', '')
-            
-            stop_loss_price = current_price * 0.965
-            tp1_price = current_price * 1.03
-            tp2_price = current_price * 1.07
-            
-            message = (
-                f"🚨 <b>СИГНАЛ НА ПОКУПКУ!</b>\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"💰 <b>Монета:</b> {coin_name}\n"
-                f" <b>Пара:</b> {symbol.replace('/', '')}\n"
-                f"💲 <b>Цена входа:</b> ${current_price:.8f}\n"
-                f"📊 <b>Объем 24ч:</b> ${volume_24h:,.0f}\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"🎯 <b>ЦЕЛЬ 1 (+3%):</b> ${tp1_price:.8f} <i>(Забрать 50%)</i>\n"
-                f" <b>ЦЕЛЬ 2 (+7%):</b> ${tp2_price:.8f} <i>(Забрать остаток)</i>\n"
-                f"🛑 <b>СТОП-ЛОСС (-3.5%):</b> ${stop_loss_price:.8f}\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"💡 <i>Совет: Забери половину на Цели 1 и переведи стоп в безубыток!</i>\n"
-                f" <b>Таймфрейм:</b> {timeframe}\n"
-                f"📈 <b>RSI:</b> {curr_rsi:.2f} | <b>SMA:</b> {curr_sma:.2f}\n"
-                f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"🔄 #{coin_name}"
-            )
-            return True, message
-        
-        return False, ""
-            
-    except Exception as e:
-        return False, ""
+# --- СКАНИРОВАНИЕ ---
+def scan_markets_task():
+    exchanges = get_exchanges()
+    all_coins = {}
+    mexc_coins = set()
+    
+    print("🔄 Загрузка рынков...")
+    for name, ex in exchanges.items():
+        try:
+            ex.load_markets()
+            print(f"✅ {name} загружена")
+        except Exception as e:
+            print(f"⚠️ Ошибка {name}: {e}")
+            del exchanges[name]
 
-# --- ГЛАВНАЯ ---
-def main():
-    print("="*50)
-    print(" ЗАПУСК СКАНЕРА СИГНАЛОВ (С УРОВНЯМИ)")
-    print("="*50)
-    print(f"⏱ Таймфреймы: {TIMEFRAMES}")
-    print(f"💰 Мин. объем: ${VOLUME_MIN:,}")
-    print(f"⏰ Кулдаун: {SIGNAL_COOLDOWN_HOURS} часов")
-    print("="*50)
+    print(f"\n🔍 Сканирую (мин. объем: ${MIN_VOLUME:,})...")
     
-    exchange = init_exchange()
-    if exchange is None:
-        return
+    for name, ex in exchanges.items():
+        try:
+            print(f"📊 Сканирую {name}...")
+            tickers = ex.fetch_tickers()
+            
+            for symbol, ticker in tickers.items():
+                if symbol.endswith('/USDT'):
+                    volume = float(ticker.get('quoteVolume', 0) or 0)
+                    coin = symbol.replace('/USDT', '')
+                    
+                    if volume >= MIN_VOLUME:
+                        if coin not in all_coins:
+                            all_coins[coin] = []
+                        if name not in all_coins[coin]:
+                            all_coins[coin].append(name)
+                            
+                    if name == 'MEXC':
+                        mexc_coins.add(coin)
+                        
+        except Exception as e:
+            print(f"❌ Ошибка {name}: {e}")
+            continue
+
+    final_coins = {}
+    for coin, ex_list in all_coins.items():
+        if coin in mexc_coins:
+            final_coins[coin] = ex_list
+
+    sorted_coins = sorted(final_coins.items(), key=lambda x: len(x[1]), reverse=True)
+    return sorted_coins
+
+# --- КНОПКА ---
+def get_scan_keyboard():
+    keyboard = [[InlineKeyboardButton("🔍 Найти монеты", callback_data='scan')]]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- /START ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        " <b>СКАНЕР MEXC SPOT С УРОВНЯМИ S/R!</b>\n\n"
+        "Бот ищет монеты с объемом > $5 млн на:\n"
+        "Binance, Bybit, Bitget, BingX, MEXC.\n"
+        "✅ Показывает только те, что есть на <b>MEXC SPOT</b>\n"
+        " К каждой монете график (1H + 4H) с уровнями!\n"
+        "📏 Уровни: 2+ касаний (только непробитые)\n\n"
+        "Нажми кнопку ниже 👇",
+        reply_markup=get_scan_keyboard(),
+        parse_mode='HTML'
+    )
+
+# --- КНОПКА СКАНИРОВАНИЯ ---
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
-    send_telegram_message(
-        f"🤖 <b>Сканер запущен!</b>\n\n"
-        f"⏱ Таймфреймы: {', '.join(TIMEFRAMES)}\n"
-        f"💰 Мин. объем: ${VOLUME_MIN:,}\n"
-        f"🎯 Стратегия: SL 3.5% | TP1 3% | TP2 7%\n"
-        f"⏰ Кулдаун: {SIGNAL_COOLDOWN_HOURS} часов\n\n"
-        f"💡 Напиши <b>/start</b> чтобы проверить статус бота"
+    status_msg = await query.message.reply_text(
+        "⏳ <b>Сканирую биржи...</b>\n\n"
+        "Это займёт 3-5 минут (графики с уровнями).",
+        parse_mode='HTML'
     )
     
-    # 🔧 ЗАПУСКАЕМ СЛУШАТЕЛЬ КОМАНД В ОТДЕЛЬНОМ ПОТОКЕ
-    listener_thread = threading.Thread(target=telegram_commands_listener, daemon=True)
-    listener_thread.start()
-    print("✅ Слушатель команд запущен в отдельном потоке")
+    loop = asyncio.get_event_loop()
+    sorted_coins = await loop.run_in_executor(None, scan_markets_task)
     
-    # Получаем все монеты с объёмом один раз
-    print("\n📊 Загружаем список монет...")
-    tickers = exchange.fetch_tickers()
+    await status_msg.delete()
     
-    qualified_symbols = []
-    for symbol, ticker in tickers.items():
-        if symbol.endswith('/USDT'):
-            volume_24h = float(ticker.get('quoteVolume', 0) or 0)
-            if volume_24h >= VOLUME_MIN:
-                qualified_symbols.append((symbol, volume_24h))
+    if not sorted_coins:
+        await query.message.reply_text(
+            " Монеты не найдены. Попробуй позже.",
+            reply_markup=get_scan_keyboard()
+        )
+        return
     
-    print(f"✅ Найдено {len(qualified_symbols)} монет с объёмом > ${VOLUME_MIN:,}")
+    total = len(sorted_coins)
+    print(f"\n📊 Найдено {total} монет. Начинаю отправку с графиками...")
     
-    # Бесконечный цикл проверки
-    cycle = 1
-    while True:
+    chart_exchanges = {}
+    for name in ['Binance', 'Bybit', 'Bitget', 'BingX', 'MEXC']:
         try:
-            print(f"\n{'='*50}")
-            print(f"🔄 ЦИКЛ #{cycle} | {datetime.now().strftime('%H:%M:%S')}")
-            print(f"{'='*50}")
+            if name == 'Binance':
+                chart_exchanges[name] = ccxt.binance({'enableRateLimit': True, 'timeout': 30000})
+                chart_exchanges[name].load_markets()
+            elif name == 'Bybit':
+                chart_exchanges[name] = ccxt.bybit({'enableRateLimit': True, 'timeout': 30000})
+                chart_exchanges[name].load_markets()
+            elif name == 'Bitget':
+                chart_exchanges[name] = ccxt.bitget({'enableRateLimit': True, 'timeout': 30000})
+                chart_exchanges[name].load_markets()
+            elif name == 'BingX':
+                chart_exchanges[name] = ccxt.bingx({'enableRateLimit': True, 'timeout': 30000})
+                chart_exchanges[name].load_markets()
+            elif name == 'MEXC':
+                chart_exchanges[name] = ccxt.mexc({'enableRateLimit': True, 'timeout': 30000, 'options': {'defaultType': 'spot'}})
+                chart_exchanges[name].load_markets()
+            print(f"✅ {name} подключена для графиков")
+        except Exception as e:
+            print(f"⚠️ {name} не подключена: {e}")
+    
+    sent_count = 0
+    failed_count = 0
+    no_chart_count = 0
+    
+    for i, (coin, ex_list) in enumerate(sorted_coins, 1):
+        try:
+            symbol = f"{coin}/USDT"
+            ex_str = ', '.join(ex_list)
             
-            signals_found = 0
+            chart_file = create_chart(symbol, chart_exchanges)
             
-            for timeframe in TIMEFRAMES:
-                print(f"\n Таймфрейм: {timeframe}")
-                
-                for i, (symbol, volume) in enumerate(qualified_symbols, 1):
-                    if i % 50 == 0:
-                        print(f"📈 [{i}/{len(qualified_symbols)}] {symbol}")
-                    
-                    signal_found, message = check_signal(exchange, symbol, timeframe, volume)
-                    if signal_found:
-                        print(f"✅ СИГНАЛ! {symbol} {timeframe}")
-                        send_telegram_message(message)
-                        signals_found += 1
+            caption = (
+                f"<b>{i}) {coin}USDT</b>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f" <b>Биржи:</b> {ex_str}\n"
+                f"📊 <b>График:</b> 1H + 4H с уровнями S/R\n"
+                f"📏 <b>Уровни:</b> 2+ касаний (непробитые)\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            )
             
-            print(f"\n🎯 Цикл #{cycle} завершён. Найдено сигналов: {signals_found}")
+            if chart_file and os.path.exists(chart_file):
+                with open(chart_file, 'rb') as photo:
+                    await query.message.reply_photo(
+                        photo=photo,
+                        caption=caption,
+                        parse_mode='HTML'
+                    )
+                os.remove(chart_file)
+                sent_count += 1
+                print(f"✅ [{i}/{total}] {coin} отправлен с графиком")
+            else:
+                await query.message.reply_text(
+                    f"{caption}\n⚠️ <i>График не удалось загрузить</i>",
+                    parse_mode='HTML'
+                )
+                no_chart_count += 1
+                print(f"⚠️ [{i}/{total}] {coin} без графика")
             
-            # Обновляем список монет каждые 10 циклов
-            if cycle % 10 == 0:
-                print("\n🔄 Обновляем список монет...")
-                tickers = exchange.fetch_tickers()
-                qualified_symbols = []
-                for symbol, ticker in tickers.items():
-                    if symbol.endswith('/USDT'):
-                        volume_24h = float(ticker.get('quoteVolume', 0) or 0)
-                        if volume_24h >= VOLUME_MIN:
-                            qualified_symbols.append((symbol, volume_24h))
-                print(f"✅ Обновлено: {len(qualified_symbols)} монет")
-            
-            cycle += 1
-            
-            # Пауза между циклами
-            print("\n⏳ Пауза 10 секунд...")
-            time.sleep(10)
-            
-        except KeyboardInterrupt:
-            print("\n👋 Остановлено")
-            send_telegram_message("👋 Сканер остановлен")
-            break
+            await asyncio.sleep(3)
             
         except Exception as e:
-            print(f"❌ Ошибка: {e}")
-            time.sleep(30)
+            error_msg = str(e)
+            
+            if 'Flood control' in error_msg or 'flood' in error_msg.lower():
+                print(f"⏸️ [{i}/{total}] Flood control! Ждём 60 секунд...")
+                await asyncio.sleep(60)
+                try:
+                    if chart_file and os.path.exists(chart_file):
+                        with open(chart_file, 'rb') as photo:
+                            await query.message.reply_photo(
+                                photo=photo,
+                                caption=caption,
+                                parse_mode='HTML'
+                            )
+                        os.remove(chart_file)
+                        sent_count += 1
+                        print(f"✅ [{i}/{total}] {coin} отправлен после ожидания")
+                    else:
+                        await query.message.reply_text(caption, parse_mode='HTML')
+                        no_chart_count += 1
+                except Exception as retry_error:
+                    failed_count += 1
+                    print(f"❌ [{i}/{total}] {coin} повторная ошибка: {retry_error}")
+            else:
+                failed_count += 1
+                print(f"❌ [{i}/{total}] {coin} ошибка: {e}")
+            continue
+    
+    summary = (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ <b>СКАНИРОВАНИЕ ЗАВЕРШЕНО!</b>\n\n"
+        f" <b>Всего найдено:</b> {total} монет\n"
+        f"✅ <b>С графиками:</b> {sent_count}\n"
+        f"️ <b>Без графиков:</b> {no_chart_count}\n"
+        f" <b>Ошибок:</b> {failed_count}\n"
+        f"💰 <b>Фильтр:</b> объем > $5,000,000\n"
+        f"✅ <b>Проверка:</b> есть на MEXC SPOT\n"
+        f"📏 <b>Уровни:</b> 2+ касаний (непробитые)\n"
+        f"⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    
+    await query.message.reply_text(
+        summary,
+        reply_markup=get_scan_keyboard(),
+        parse_mode='HTML'
+    )
+    
+    print(f"\n✅ Готово! С графиками: {sent_count}, Без графиков: {no_chart_count}, Ошибок: {failed_count}")
+
+# --- ЗАПУСК ---
+def main():
+    print("="*50)
+    print("🚀 ЗАПУСК СКАНЕРА MEXC SPOT С УРОВНЯМИ S/R")
+    print("="*50)
+    
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_click))
+    
+    print("✅ Бот готов. Жду команду /start в Telegram...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n👋 Остановлено")
+    main()
